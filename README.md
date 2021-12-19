@@ -1,2 +1,2 @@
 # ChituBoard
-Post Processing Script for Chitu board
+Thumbnail Post Processing Script for use with Prusa/SuperSlicer
