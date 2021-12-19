@@ -1,0 +1,195 @@
+#!/usr/bin/python3
+
+# ------------------------------------------------------------------------------
+# Prusa / Super Slicer post-processor script for printers with chitu boards
+# URL: https://github.com/mriscoc/ChituBoard
+# version: 1.1
+# date: 2021/12/19
+# author: Miguel Risco-Castillo
+#
+# Contains code from:
+#   github.com/Ultimaker/Cura/blob/b94c6aac5f80485acc24e683805e44db8e00f815/plugins/PostProcessingPlugin/scripts/ChituMods.py
+# and:
+#   github.com/alexqzd/Marlin/blob/Gcode-preview/Display%20firmware/gcode_thumb_to_jpg.py
+# ------------------------------------------------------------------------------
+
+import sys
+import re
+import os
+import base64 
+import io
+import subprocess
+
+try:
+    from PIL import Image
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow"])
+    from PIL import Image
+    
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Generates Chitu board thumbnail codes
+def generate_image_code(image, startX=0, startY=0, endX=300, endY=300):
+    MAX_PIC_WIDTH_HEIGHT = 320
+    width, height = image.size
+    if endX > width:
+        endX = width
+    if endY > height:
+        endY = height
+    scale = 1.0
+    max_edge = endY - startY
+    if max_edge < endX - startX:
+        max_edge = endX - startX
+    if max_edge > MAX_PIC_WIDTH_HEIGHT:
+        scale = MAX_PIC_WIDTH_HEIGHT / max_edge
+    if scale != 1.0:
+        width = int(width * scale)
+        height = int(height * scale)
+        startX = int(startX * scale)
+        startY = int(startY * scale)
+        endX = int(endX * scale)
+        endY = int(endY * scale)
+        image = image.scaled(width, height)
+    rgb_im = image.convert('RGB')
+    res_list = []
+    print('StartY:', startY, ' endY:', endY)
+    for i in range(startY, endY):
+        for j in range(startX, endX):
+            res_list.append(rgb_im.getpixel((j, i)))
+    index_pixel = 0
+    pixel_num = 0
+    pixel_data = ''
+    pixel_list = []
+    pixel_list.append('M4010 X%d Y%d' % (endX - startX, endY - startY))
+    last_color = -1
+    mask = 32
+    unmask = ~mask
+    same_pixel = 1
+    color = 0
+    for j in res_list:
+        r, g, b = j
+        color = (r >> 3 << 11 | g >> 2 << 5 | b >> 3) & unmask
+        if last_color == -1:
+            last_color = color
+        elif last_color == color and same_pixel < 4095:
+            same_pixel += 1
+        elif same_pixel >= 2:
+            pixel_data += '%04x' % (last_color | mask)
+            pixel_data += '%04x' % (12288 | same_pixel)
+            pixel_num += same_pixel
+            last_color = color
+            same_pixel = 1
+        else:
+            pixel_data += '%04x' % last_color
+            last_color = color
+            pixel_num += 1
+        if len(pixel_data) >= 180:
+            pixel_list.append("M4010 I%d T%d '%s'" % (index_pixel, pixel_num, pixel_data))
+            pixel_data = ''
+            index_pixel += pixel_num
+            pixel_num = 0
+
+    if same_pixel >= 2:
+        pixel_data += '%04x' % (last_color | mask)
+        pixel_data += '%04x' % (12288 | same_pixel)
+        pixel_num += same_pixel
+        last_color = color
+        same_pixel = 1
+    else:
+        pixel_data += '%04x' % last_color
+        last_color = color
+        pixel_num += 1
+    pixel_list.append("M4010 I%d T%d '%s'" % (index_pixel, pixel_num, pixel_data))
+    return pixel_list
+
+# Get the g-code source file name
+sourceFile = sys.argv[1]
+
+# Read the ENTIRE g-code file into memory
+with open(sourceFile, "r") as f:
+    lines = f.read()
+
+thumb_expresion = '; thumbnail begin.*?\n((.|\n)*?); thumbnail end'
+size_expresion = '; thumbnail begin [0-9]+x[0-9]+ [0-9]+'
+size_expresion_group = '; thumbnail begin [0-9]+x[0-9]+ ([0-9]+)'
+
+thumb_matches = re.findall(thumb_expresion, lines)
+size_matches = re.findall(size_expresion, lines)
+
+def encodedStringToGcodeComment(encodedString):
+    n = 78
+    return '; ' + '\n; '.join(encodedString[i:i+n] for i in range(0, len(encodedString), n)) + '\n'
+
+
+for idx, match in enumerate(thumb_matches):
+    original = match[0]
+    encoded = original.replace("; ", "")
+    encoded = encoded.replace("\n", "")
+    encoded = encoded.replace("\r", "")
+    decoded = base64.b64decode(encoded)
+    img_png = Image.open(io.BytesIO(decoded))
+    img_png_rgb = img_png.convert('RGB')
+    img_byte_arr = io.BytesIO()
+    img_png_rgb.save(img_byte_arr, format='jpeg')
+    img_byte_arr = img_byte_arr.getvalue()
+    encodedjpg = base64.b64encode(img_byte_arr).decode("utf-8")
+    encodedjpg_gcode = encodedStringToGcodeComment(encodedjpg)
+    lines = lines.replace(original, encodedjpg_gcode)
+
+    size_match = size_matches[idx]
+    size = re.findall(size_expresion_group, size_match)
+    new_size = size_match.replace(size[0], str(len(encodedjpg)))
+    lines = lines.replace(size_match, new_size)
+
+#Prepare header values
+ph = re.search('; generated by (.*)\n', lines)[0]
+lines = lines.replace(ph, "")
+
+match = re.search('; estimated printing time \(normal mode\) = (.*)\n', lines)[1]
+h = re.search('(\d+)h',match)
+h = int(h[1]) if h is not None else 0
+m = re.search('(\d+)m',match)
+m = int(m[1]) if m is not None else 0
+s = re.search('(\d+)s',match)
+s = int(s[1]) if s is not None else 0
+time = h*3600+m*60+s
+
+match = re.search('; filament used \[mm\] = (.*)\n', lines)
+filament = float(match[1])/1000 if match is not None else 0
+
+match = os.getenv('SLIC3R_LAYER_HEIGHT')
+layer = float(match) if match is not None else 0
+
+minx = 0
+miny = 0
+minz = 0
+maxx = 0
+maxy = 0
+maxz = 0
+
+with open(sourceFile, "w") as of:
+
+# Chitu thumbnail
+    for element in generate_image_code(img_png):
+      of.write(element + "\n")
+    of.write("\n")
+
+# Write header values
+    of.write(';FLAVOR:Marlin\n')
+    of.write('M2100 T{:d}\n'.format(time))
+    of.write(';TIME:{:d}\n'.format(time))
+    of.write(';Filament used: {:.6f}\n'.format(filament))
+    of.write(';Layer height: {:.2f}\n'.format(layer))
+    of.write(';MINX:{:.3f}\n'.format(minx))
+    of.write(';MINY:{:.3f}\n'.format(miny))
+    of.write(';MINZ:{:.3f}\n'.format(minz))
+    of.write(';MAXX:{:.3f}\n'.format(maxx))
+    of.write(';MAXY:{:.3f}\n'.format(maxy))
+    of.write(';MAXZ:{:.3f}\n'.format(maxz))
+    of.write(';POSTPROCESSED\n')
+    of.write(ph)
+    of.write(lines)
+
+of.close()
+f.close()
